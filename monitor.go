@@ -119,6 +119,7 @@ type MonitorEvent struct {
 	Type  MonitorEventType
 	Data  any
 	Error error
+	PID   uint32
 }
 
 const (
@@ -224,6 +225,7 @@ func (monitor *Monitor) monitor() {
 					Type:  MonitorEventType(msgType),
 					Data:  table,
 					Error: err,
+					PID:   msg.Header.PID,
 				}
 				monitor.eventCh <- event
 			case unix.NFT_MSG_NEWCHAIN, unix.NFT_MSG_DELCHAIN:
@@ -232,14 +234,22 @@ func (monitor *Monitor) monitor() {
 					Type:  MonitorEventType(msgType),
 					Data:  chain,
 					Error: err,
+					PID:   msg.Header.PID,
 				}
 				monitor.eventCh <- event
 			case unix.NFT_MSG_NEWRULE, unix.NFT_MSG_DELRULE:
+				if len(msgs) > 1 {
+					// If the length is more than 1, it could be due to chain/table add or delete.
+					// So don't need to send these rule events as this will overwhelm the events
+					// in case of large number of rules.
+					continue
+				}
 				rule, err := parseRuleFromMsg(msg)
 				event := &MonitorEvent{
 					Type:  MonitorEventType(msgType),
 					Data:  rule,
 					Error: err,
+					PID:   msg.Header.PID,
 				}
 				monitor.eventCh <- event
 			case unix.NFT_MSG_NEWSET, unix.NFT_MSG_DELSET:
@@ -248,6 +258,7 @@ func (monitor *Monitor) monitor() {
 					Type:  MonitorEventType(msgType),
 					Data:  set,
 					Error: err,
+					PID:   msg.Header.PID,
 				}
 				monitor.eventCh <- event
 			case unix.NFT_MSG_NEWSETELEM, unix.NFT_MSG_DELSETELEM:
@@ -256,6 +267,7 @@ func (monitor *Monitor) monitor() {
 					Type:  MonitorEventType(msgType),
 					Data:  elems,
 					Error: err,
+					PID:   msg.Header.PID,
 				}
 				monitor.eventCh <- event
 			case unix.NFT_MSG_NEWOBJ, unix.NFT_MSG_DELOBJ:
@@ -264,6 +276,7 @@ func (monitor *Monitor) monitor() {
 					Type:  MonitorEventType(msgType),
 					Data:  obj,
 					Error: err,
+					PID:   msg.Header.PID,
 				}
 				monitor.eventCh <- event
 			}
@@ -300,7 +313,7 @@ func (cc *Conn) AddMonitor(monitor *Monitor) (chan *MonitorEvent, error) {
 	}
 	monitor.conn = conn
 	monitor.closer = closer
-
+	conn.SetOption(netlink.NoENOBUFS, true)
 	if monitor.monitorFlags != 0 {
 		if err = conn.JoinGroup(uint32(unix.NFNLGRP_NFTABLES)); err != nil {
 			monitor.closer()

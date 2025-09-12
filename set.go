@@ -289,6 +289,12 @@ type SetElement struct {
 	Counter *expr.Counter
 }
 
+// SetElementsEvent represents a set elements add or delete event.
+type SetElementsEvent struct {
+	Set      *Set
+	Elements []SetElement
+}
+
 func (s *SetElement) decode(fam byte) func(b []byte) error {
 	return func(b []byte) error {
 		ad, err := netlink.NewAttributeDecoder(b)
@@ -757,6 +763,12 @@ func setsFromMsg(msg netlink.Message) (*Set, error) {
 			data := ad.Bytes()
 			value, ok := userdata.GetUint32(data, userdata.NFTNL_UDATA_SET_MERGE_ELEMENTS)
 			set.AutoMerge = ok && value == 1
+		case unix.NFTA_SET_TABLE:
+			tblName := ad.String()
+			set.Table = &Table{
+				Name:   tblName,
+				Family: TableFamily(msg.Data[0]),
+			}
 		}
 	}
 	return &set, nil
@@ -787,7 +799,7 @@ var (
 	delElemHeaderType = netlink.HeaderType((unix.NFNL_SUBSYS_NFTABLES << 8) | unix.NFT_MSG_DELSETELEM)
 )
 
-func elementsFromMsg(fam byte, msg netlink.Message) ([]SetElement, error) {
+func elementsFromMsg(fam byte, msg netlink.Message) (*SetElementsEvent, error) {
 	if got, want1, want2 := msg.Header.Type, newElemHeaderType, delElemHeaderType; got != want1 && got != want2 {
 		return nil, fmt.Errorf("unexpected header type: got %v, want %v or %v", got, want1, want2)
 	}
@@ -797,27 +809,36 @@ func elementsFromMsg(fam byte, msg netlink.Message) ([]SetElement, error) {
 	}
 	ad.ByteOrder = binary.BigEndian
 
-	var elements []SetElement
+	var setElementsEvent SetElementsEvent
+	setElementsEvent.Set = &Set{}
+
 	for ad.Next() {
-		b := ad.Bytes()
-		if ad.Type() == unix.NFTA_SET_ELEM_LIST_ELEMENTS {
-			ad, err := netlink.NewAttributeDecoder(b)
+		switch ad.Type() {
+		case unix.NFTA_SET_TABLE:
+			tblName := ad.String()
+			setElementsEvent.Set.Table = &Table{
+				Name:   tblName,
+				Family: TableFamily(msg.Data[0]),
+			}
+		case unix.NFTA_SET_NAME:
+			setElementsEvent.Set.Name = ad.String()
+		case unix.NFTA_SET_ELEM_LIST_ELEMENTS:
+			innerAd, err := netlink.NewAttributeDecoder(ad.Bytes())
 			if err != nil {
 				return nil, err
 			}
-			ad.ByteOrder = binary.BigEndian
+			innerAd.ByteOrder = binary.BigEndian
 
-			for ad.Next() {
+			for innerAd.Next() {
 				var elem SetElement
-				switch ad.Type() {
-				case unix.NFTA_LIST_ELEM:
-					ad.Do(elem.decode(fam))
+				if innerAd.Type() == unix.NFTA_LIST_ELEM {
+					innerAd.Do(elem.decode(fam))
 				}
-				elements = append(elements, elem)
+				setElementsEvent.Elements = append(setElementsEvent.Elements, elem)
 			}
 		}
 	}
-	return elements, nil
+	return &setElementsEvent, nil
 }
 
 // GetSets returns the sets in the specified table.
@@ -947,7 +968,7 @@ func (cc *Conn) GetSetElements(s *Set) ([]SetElement, error) {
 		if err != nil {
 			return nil, err
 		}
-		elems = append(elems, s...)
+		elems = append(elems, s.Elements...)
 	}
 
 	return elems, nil

@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/google/nftables"
 	"github.com/google/nftables/expr"
@@ -136,5 +137,130 @@ func TestMonitor(t *testing.T) {
 	}
 	if len(gotRule.Exprs) != len(rule.Exprs) {
 		t.Fatal("no want rule")
+	}
+}
+
+func TestMonitorEmitsOneEventForRuleOnlyBatch(t *testing.T) {
+	c, newNS := nftest.OpenSystemConn(t, *enableSysTests)
+	defer nftest.CleanupSystemConn(t, newNS)
+	c.FlushRuleset()
+	defer c.FlushRuleset()
+
+	table := c.AddTable(&nftables.Table{
+		Family: nftables.TableFamilyIPv4,
+		Name:   "filter",
+	})
+	chain := c.AddChain(&nftables.Chain{
+		Name:  "input",
+		Table: table,
+	})
+	for i := 0; i < 100; i++ {
+		c.AddRule(&nftables.Rule{
+			Table: chain.Table,
+			Chain: chain,
+			Exprs: []expr.Any{&expr.Counter{}},
+		})
+	}
+	if err := c.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	monitor := nftables.NewMonitor(
+		nftables.WithMonitorAction(nftables.MonitorActionDel),
+		nftables.WithMonitorObject(nftables.MonitorObjectRules),
+	)
+	events, err := c.AddMonitor(monitor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer monitor.Close()
+
+	c.FlushChain(chain)
+	if err := c.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case event := <-events:
+		if event.Error != nil {
+			t.Fatal(event.Error)
+		}
+		if event.Type != nftables.MonitorEventTypeDelRule {
+			t.Fatalf("event type = %v, want %v", event.Type, nftables.MonitorEventTypeDelRule)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no rule event received for chain flush")
+	}
+
+	select {
+	case event := <-events:
+		t.Fatalf("unexpected additional rule event: %+v", event)
+	case <-time.After(500 * time.Millisecond):
+	}
+}
+
+func TestMonitorEmitsReplaceRuleEvent(t *testing.T) {
+	c, newNS := nftest.OpenSystemConn(t, *enableSysTests)
+	defer nftest.CleanupSystemConn(t, newNS)
+	c.FlushRuleset()
+	defer c.FlushRuleset()
+
+	table := c.AddTable(&nftables.Table{
+		Family: nftables.TableFamilyIPv4,
+		Name:   "filter",
+	})
+	chain := c.AddChain(&nftables.Chain{
+		Name:  "output",
+		Table: table,
+	})
+	c.AddRule(&nftables.Rule{
+		Table: table,
+		Chain: chain,
+		Exprs: []expr.Any{&expr.Verdict{Kind: expr.VerdictAccept}},
+	})
+	if err := c.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	rules, err := c.GetRules(table, chain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rules) != 1 {
+		t.Fatalf("rules = %d, want 1", len(rules))
+	}
+
+	monitor := nftables.NewMonitor(
+		nftables.WithMonitorAction(nftables.MonitorActionNew),
+		nftables.WithMonitorObject(nftables.MonitorObjectRules),
+	)
+	events, err := c.AddMonitor(monitor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer monitor.Close()
+
+	c.ReplaceRule(&nftables.Rule{
+		Table:  table,
+		Chain:  chain,
+		Handle: rules[0].Handle,
+		Exprs:  []expr.Any{&expr.Verdict{Kind: expr.VerdictDrop}},
+	})
+	if err := c.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case event := <-events:
+		if event.Error != nil {
+			t.Fatal(event.Error)
+		}
+		if event.Type != nftables.MonitorEventTypeNewRule {
+			t.Fatalf("event type = %v, want %v", event.Type, nftables.MonitorEventTypeNewRule)
+		}
+		if event.Data.(*nftables.Rule).Handle != rules[0].Handle {
+			t.Fatalf("rule handle = %d, want %d", event.Data.(*nftables.Rule).Handle, rules[0].Handle)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no rule event received for rule replacement")
 	}
 }

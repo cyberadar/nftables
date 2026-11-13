@@ -146,6 +146,55 @@ type Monitor struct {
 
 type MonitorOption func(*Monitor)
 
+// ruleEventBatchKey is the key for the rule event batch limiter.
+type ruleEventBatchKey struct {
+	pid   uint32
+	table string
+}
+
+// ruleEventBatchLimiter is used to limit the number of rule events emitted per table and process.
+type ruleEventBatchLimiter struct {
+	emitted map[ruleEventBatchKey]struct{}
+}
+
+// newRuleEventBatchLimiter creates a new rule event batch limiter.
+// It is used to limit the number of rule events emitted per table and process.
+func newRuleEventBatchLimiter() ruleEventBatchLimiter {
+	return ruleEventBatchLimiter{
+		emitted: make(map[ruleEventBatchKey]struct{}),
+	}
+}
+
+// ruleTableNameFromMsg extracts the table name from the netlink message.
+func ruleTableNameFromMsg(msg netlink.Message) string {
+	if len(msg.Data) < 4 {
+		return ""
+	}
+	ad, err := netlink.NewAttributeDecoder(msg.Data[4:])
+	if err != nil {
+		return ""
+	}
+	for ad.Next() {
+		if ad.Type() == unix.NFTA_RULE_TABLE {
+			return ad.String()
+		}
+	}
+	return ""
+}
+
+// allow checks if the rule event should be emitted.
+func (l *ruleEventBatchLimiter) allow(msg netlink.Message) bool {
+	key := ruleEventBatchKey{
+		pid:   msg.Header.PID,
+		table: ruleTableNameFromMsg(msg),
+	}
+	if _, emitted := l.emitted[key]; emitted {
+		return false
+	}
+	l.emitted[key] = struct{}{}
+	return true
+}
+
 func WithMonitorEventBuffer(size int) MonitorOption {
 	return func(monitor *Monitor) {
 		monitor.eventCh = make(chan *MonitorEvent, size)
@@ -210,6 +259,7 @@ func (monitor *Monitor) monitor() {
 				break
 			}
 		}
+		ruleEvents := newRuleEventBatchLimiter()
 		for _, msg := range msgs {
 			if msg.Header.Type&0xff00>>8 != netlink.HeaderType(unix.NFNL_SUBSYS_NFTABLES) {
 				continue
@@ -238,10 +288,9 @@ func (monitor *Monitor) monitor() {
 				}
 				monitor.eventCh <- event
 			case unix.NFT_MSG_NEWRULE, unix.NFT_MSG_DELRULE:
-				if len(msgs) > 1 {
-					// If the length is more than 1, it could be due to chain/table add or delete.
-					// So don't need to send these rule events as this will overwhelm the events
-					// in case of large number of rules.
+				// Emit one representative rule per table and originating process so
+				// large batches remain detectable without overwhelming consumers.
+				if !ruleEvents.allow(msg) {
 					continue
 				}
 				rule, err := parseRuleFromMsg(msg)

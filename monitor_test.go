@@ -140,7 +140,27 @@ func TestMonitor(t *testing.T) {
 	}
 }
 
-func TestMonitorEmitsOneEventForRuleOnlyBatch(t *testing.T) {
+// drainMonitorEvents collects events until none arrive for the given idle period.
+func drainMonitorEvents(t *testing.T, events chan *nftables.MonitorEvent, idle time.Duration) []*nftables.MonitorEvent {
+	t.Helper()
+	var got []*nftables.MonitorEvent
+	for {
+		select {
+		case event, ok := <-events:
+			if !ok {
+				return got
+			}
+			if event.Error != nil {
+				t.Fatal(event.Error)
+			}
+			got = append(got, event)
+		case <-time.After(idle):
+			return got
+		}
+	}
+}
+
+func TestMonitorCoalescesRuleEventsForChainFlush(t *testing.T) {
 	c, newNS := nftest.OpenSystemConn(t, *enableSysTests)
 	defer nftest.CleanupSystemConn(t, newNS)
 	c.FlushRuleset()
@@ -180,26 +200,80 @@ func TestMonitorEmitsOneEventForRuleOnlyBatch(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	select {
-	case event := <-events:
-		if event.Error != nil {
-			t.Fatal(event.Error)
-		}
+	// The kernel splits large changes across message groups (or sends one message per
+	// group on older kernels), so the limiter reduces events rather than guaranteeing one.
+	got := drainMonitorEvents(t, events, 500*time.Millisecond)
+	if len(got) == 0 {
+		t.Fatal("no rule event received for chain flush")
+	}
+	if len(got) >= 100 {
+		t.Fatalf("rule events = %d, want fewer than one per deleted rule", len(got))
+	}
+	for _, event := range got {
 		if event.Type != nftables.MonitorEventTypeDelRule {
 			t.Fatalf("event type = %v, want %v", event.Type, nftables.MonitorEventTypeDelRule)
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("no rule event received for chain flush")
-	}
-
-	select {
-	case event := <-events:
-		t.Fatalf("unexpected additional rule event: %+v", event)
-	case <-time.After(500 * time.Millisecond):
 	}
 }
 
-func TestMonitorEmitsReplaceRuleEvent(t *testing.T) {
+func TestMonitorCoalescesRuleEventsPerTable(t *testing.T) {
+	c, newNS := nftest.OpenSystemConn(t, *enableSysTests)
+	defer nftest.CleanupSystemConn(t, newNS)
+	c.FlushRuleset()
+	defer c.FlushRuleset()
+
+	var chains []*nftables.Chain
+	for _, name := range []string{"filter", "other"} {
+		table := c.AddTable(&nftables.Table{
+			Family: nftables.TableFamilyIPv4,
+			Name:   name,
+		})
+		chain := c.AddChain(&nftables.Chain{
+			Name:  "input",
+			Table: table,
+		})
+		for i := 0; i < 5; i++ {
+			c.AddRule(&nftables.Rule{
+				Table: table,
+				Chain: chain,
+				Exprs: []expr.Any{&expr.Counter{}},
+			})
+		}
+		chains = append(chains, chain)
+	}
+	if err := c.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	monitor := nftables.NewMonitor(
+		nftables.WithMonitorAction(nftables.MonitorActionDel),
+		nftables.WithMonitorObject(nftables.MonitorObjectRules),
+	)
+	events, err := c.AddMonitor(monitor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer monitor.Close()
+
+	for _, chain := range chains {
+		c.FlushChain(chain)
+	}
+	if err := c.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	tables := map[string]bool{}
+	for _, event := range drainMonitorEvents(t, events, 500*time.Millisecond) {
+		tables[event.Data.(*nftables.Rule).Table.Name] = true
+	}
+	for _, chain := range chains {
+		if !tables[chain.Table.Name] {
+			t.Fatalf("no rule event for table %q; a change in one table must not hide another", chain.Table.Name)
+		}
+	}
+}
+
+func TestMonitorEmitsReplaceRuleEvents(t *testing.T) {
 	c, newNS := nftest.OpenSystemConn(t, *enableSysTests)
 	defer nftest.CleanupSystemConn(t, newNS)
 	c.FlushRuleset()
@@ -229,8 +303,9 @@ func TestMonitorEmitsReplaceRuleEvent(t *testing.T) {
 		t.Fatalf("rules = %d, want 1", len(rules))
 	}
 
+	// Watch all actions, like ng-agent: a replace sends DELRULE then NEWRULE from the
+	// same process and table, and both must come through.
 	monitor := nftables.NewMonitor(
-		nftables.WithMonitorAction(nftables.MonitorActionNew),
 		nftables.WithMonitorObject(nftables.MonitorObjectRules),
 	)
 	events, err := c.AddMonitor(monitor)
@@ -249,18 +324,19 @@ func TestMonitorEmitsReplaceRuleEvent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	select {
-	case event := <-events:
-		if event.Error != nil {
-			t.Fatal(event.Error)
+	var gotDel, gotNew bool
+	for _, event := range drainMonitorEvents(t, events, 500*time.Millisecond) {
+		switch event.Type {
+		case nftables.MonitorEventTypeDelRule:
+			gotDel = true
+		case nftables.MonitorEventTypeNewRule:
+			gotNew = true
+			if len(event.Data.(*nftables.Rule).Exprs) == 0 {
+				t.Fatal("replacement rule event has no expressions")
+			}
 		}
-		if event.Type != nftables.MonitorEventTypeNewRule {
-			t.Fatalf("event type = %v, want %v", event.Type, nftables.MonitorEventTypeNewRule)
-		}
-		if event.Data.(*nftables.Rule).Handle != rules[0].Handle {
-			t.Fatalf("rule handle = %d, want %d", event.Data.(*nftables.Rule).Handle, rules[0].Handle)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("no rule event received for rule replacement")
+	}
+	if !gotDel || !gotNew {
+		t.Fatalf("replace events: DelRule=%v NewRule=%v, want both", gotDel, gotNew)
 	}
 }

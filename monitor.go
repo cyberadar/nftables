@@ -129,7 +129,8 @@ const (
 
 // A Monitor is an event-based nftables monitor that will receive one event per
 // new (or deleted) table, chain, rule, set, etc., depending on the monitor
-// configuration.
+// configuration. Rule events are reduced per received message group; see
+// ruleEventBatchLimiter.
 type Monitor struct {
 	action       MonitorAction
 	object       MonitorObject
@@ -145,6 +146,64 @@ type Monitor struct {
 }
 
 type MonitorOption func(*Monitor)
+
+// ruleEventBatchKey is the key for the rule event batch limiter. The message type keeps
+// a replace (DELRULE then NEWRULE from the same process and table) from losing the new rule.
+type ruleEventBatchKey struct {
+	pid     uint32
+	table   string
+	msgType netlink.HeaderType
+}
+
+// ruleEventBatchLimiter is a best-effort reduction of rule events within one received
+// netlink message group. The kernel splits a large change across several groups, so one
+// change can still produce several rule events; callers that need one signal per change
+// must group events themselves.
+type ruleEventBatchLimiter struct {
+	emitted map[ruleEventBatchKey]struct{}
+}
+
+// newRuleEventBatchLimiter creates a limiter for one received message group.
+func newRuleEventBatchLimiter() ruleEventBatchLimiter {
+	return ruleEventBatchLimiter{
+		emitted: make(map[ruleEventBatchKey]struct{}),
+	}
+}
+
+// ruleTableNameFromMsg extracts the table name from a rule netlink message.
+// It returns an empty string if the message has no table attribute.
+func ruleTableNameFromMsg(msg netlink.Message) string {
+	// The rule attributes follow the 4-byte nfgenmsg header.
+	if len(msg.Data) < 4 {
+		return ""
+	}
+	attributeDecoder, err := netlink.NewAttributeDecoder(msg.Data[4:])
+	if err != nil {
+		return ""
+	}
+	for attributeDecoder.Next() {
+		if attributeDecoder.Type() == unix.NFTA_RULE_TABLE {
+			return attributeDecoder.String()
+		}
+	}
+	return ""
+}
+
+// isAllowedToEmit reports whether msg is the first rule event of its process, table
+// and message type in the current message group, and records it so later matches
+// in the same group are suppressed.
+func (l *ruleEventBatchLimiter) isAllowedToEmit(msg netlink.Message) bool {
+	key := ruleEventBatchKey{
+		pid:     msg.Header.PID,
+		table:   ruleTableNameFromMsg(msg),
+		msgType: msg.Header.Type,
+	}
+	if _, emitted := l.emitted[key]; emitted {
+		return false
+	}
+	l.emitted[key] = struct{}{}
+	return true
+}
 
 func WithMonitorEventBuffer(size int) MonitorOption {
 	return func(monitor *Monitor) {
@@ -210,6 +269,7 @@ func (monitor *Monitor) monitor() {
 				break
 			}
 		}
+		ruleEvents := newRuleEventBatchLimiter()
 		for _, msg := range msgs {
 			if msg.Header.Type&0xff00>>8 != netlink.HeaderType(unix.NFNL_SUBSYS_NFTABLES) {
 				continue
@@ -238,10 +298,9 @@ func (monitor *Monitor) monitor() {
 				}
 				monitor.eventCh <- event
 			case unix.NFT_MSG_NEWRULE, unix.NFT_MSG_DELRULE:
-				if len(msgs) > 1 {
-					// If the length is more than 1, it could be due to chain/table add or delete.
-					// So don't need to send these rule events as this will overwhelm the events
-					// in case of large number of rules.
+				// Emit one rule event per process, table and message type in each received
+				// message group, so bulk changes stay detectable with far fewer events.
+				if !ruleEvents.isAllowedToEmit(msg) {
 					continue
 				}
 				rule, err := parseRuleFromMsg(msg)
